@@ -1,0 +1,447 @@
+---
+title: "Public TCGA/BRCA example for covdepGE"
+subtitle: "Covariate-dependent graphical estimation across FOXO3a"
+format:
+  html:
+    toc: true
+    embed-resources: true
+    code-fold: true
+    theme: cosmo
+execute:
+  echo: false
+  warning: false
+  message: false
+---
+
+```{r}
+#| label: setup
+helper_candidates <- c(
+  file.path(getwd(), "experiments", "dasgupta_covdepge", "brca_helpers.R"),
+  file.path(getwd(), "brca_helpers.R")
+)
+helper_path <- helper_candidates[file.exists(helper_candidates)][1]
+if (is.na(helper_path)) stop("Could not locate brca_helpers.R.", call. = FALSE)
+source(helper_path)
+
+paths <- brca_paths()
+.libPaths(c(paths[["local_library"]], .libPaths()))
+stopifnot(
+  requireNamespace("covdepGE", quietly = TRUE),
+  requireNamespace("ggplot2", quietly = TRUE),
+  requireNamespace("knitr", quietly = TRUE)
+)
+
+inputs <- audit_brca_inputs(paths[["input"]], paths[["raw"]])
+settings <- brca_fit_settings()
+if (!file.exists(paths[["result"]])) {
+  stop("Fit result is missing. Run experiments/dasgupta_covdepge/run_brca_fit.R first.", call. = FALSE)
+}
+bundle <- readRDS(paths[["result"]])
+if (!brca_result_is_current(bundle, inputs, settings)) {
+  stop(
+    "Saved fit validation failed: the bundle does not match the current inputs, settings, or covdepGE version. No refit was attempted.",
+    call. = FALSE
+  )
+}
+
+fit <- bundle[["fit"]]
+saved_inputs <- bundle[["inputs"]]
+X <- saved_inputs[["X"]]
+z <- saved_inputs[["z"]]
+sample_id <- saved_inputs[["sample_id"]]
+protein_labels <- c(
+  "STAT3 pY705",
+  "E-Cadherin",
+  "N-Cadherin",
+  "NF-kB p65 pS536"
+)
+
+stopifnot(
+  identical(X, inputs[["X"]]),
+  identical(z, inputs[["z"]]),
+  identical(sample_id, inputs[["sample_id"]]),
+  identical(rownames(X), sample_id),
+  length(protein_labels) == ncol(X),
+  length(z) == nrow(X),
+  length(sample_id) == nrow(X),
+  all(is.finite(z)),
+  !anyNA(sample_id),
+  !anyDuplicated(sample_id)
+)
+```
+
+::: {.callout-warning}
+## Scope and interpretation
+
+This report reproduces the **authors' public `covdepGE` package example**, not the exact Dasgupta et al. (2023) application dataset. The paper used a different eight-node protein set and FOXC2 covariate; this public example uses four RPPA measurements and FOXO3a. Edge-inclusion probabilities below are model-based probabilities, not partial correlations, relationship strengths, or proof of biological interactions.
+:::
+
+## Question and data
+
+The example asks whether the conditional-dependence graph among four breast-cancer protein measurements changes with FOXO3a abundance. It uses 410 TCGA Breast Invasive Carcinoma samples from the public `RTCGA.RPPA::BRCA.RPPA` object. No microbial CLR transformation or other undocumented transformation is applied. The package centers `X` and scales `z` internally under its documented defaults.
+
+The local prepared object is checked against the copied public source RDA before the saved fit is accepted. Sample identifiers remain attached as matrix row names in the exact source order.
+
+```{r}
+#| label: input-audit
+knitr::kable(
+  inputs[["audit"]],
+  caption = "Compact audit of the exact inputs used for fitting.",
+  align = c("l", "l", "c")
+)
+```
+
+```{r}
+#| label: foxo3a-histogram
+#| fig-cap: "Distribution of the FOXO3a covariate across the 410 BRCA samples."
+#| fig-width: 8
+#| fig-height: 4.5
+ggplot2::ggplot(data.frame(FOXO3a = z), ggplot2::aes(x = FOXO3a)) +
+  ggplot2::geom_histogram(bins = 35, color = "white", fill = "#2C7FB8") +
+  ggplot2::labs(x = "FOXO3a RPPA measurement", y = "Number of samples") +
+  ggplot2::theme_bw(base_size = 12)
+```
+
+## Model fit
+
+The fit uses the documented API exactly as `covdepGE::covdepGE(X, z, parallel = FALSE)` with seed `r settings[["seed"]]`. Default package hyperparameter grids and preprocessing are retained; no custom search is performed.
+
+```{r}
+#| label: fit-summary
+fit_details <- fit[["model_details"]]
+fit_warnings <- bundle[["metadata"]][["warnings"]]
+fit_summary <- data.frame(
+  Item = c(
+    "covdepGE version",
+    "RcppArmadillo version",
+    "R version",
+    "Elapsed wall time",
+    "ELBO",
+    "Unique estimated graphs",
+    "Hyperparameter grid size",
+    "Warnings"
+  ),
+  Value = c(
+    bundle[["metadata"]][["covdepGE_version"]],
+    bundle[["metadata"]][["RcppArmadillo_version"]],
+    bundle[["metadata"]][["R_version"]],
+    paste0(format(bundle[["metadata"]][["elapsed_seconds"]], digits = 4), " seconds"),
+    format(fit_details[["ELBO"]], digits = 8),
+    fit_details[["num_unique"]],
+    fit_details[["grid_size"]],
+    if (length(fit_warnings)) paste(fit_warnings, collapse = " | ") else "None"
+  ),
+  check.names = FALSE
+)
+knitr::kable(fit_summary, caption = "Fit settings and outcome.", align = c("l", "l"))
+```
+
+```{r}
+#| label: derive-saved-results
+#| include: false
+n_samples <- nrow(X)
+n_proteins <- ncol(X)
+edge_threshold <- fit[["model_details"]][["args"]][["edge_threshold"]]
+inclusion_probs_sym <- fit[["graphs"]][["inclusion_probs_sym"]]
+unique_graphs <- fit[["graphs"]][["unique_graphs"]]
+
+stopifnot(
+  is.numeric(edge_threshold),
+  length(edge_threshold) == 1L,
+  is.finite(edge_threshold),
+  edge_threshold >= 0,
+  edge_threshold <= 1,
+  is.list(inclusion_probs_sym),
+  length(inclusion_probs_sym) == n_samples,
+  all(vapply(
+    inclusion_probs_sym,
+    function(probability_matrix) {
+      is.matrix(probability_matrix) &&
+        is.numeric(probability_matrix) &&
+        identical(dim(probability_matrix), c(n_proteins, n_proteins)) &&
+        all(is.finite(probability_matrix)) &&
+        all(probability_matrix >= 0 & probability_matrix <= 1)
+    },
+    logical(1)
+  ))
+)
+
+edge_pairs <- utils::combn(seq_len(n_proteins), 2L)
+probability_table <- do.call(
+  rbind,
+  lapply(seq_len(ncol(edge_pairs)), function(pair_index) {
+    first <- edge_pairs[1L, pair_index]
+    second <- edge_pairs[2L, pair_index]
+    pair_label <- paste(protein_labels[first], "\u2014", protein_labels[second])
+
+    # IDs, covariates, and probabilities are joined in saved observation order.
+    data.frame(
+      observation_index = seq_len(n_samples),
+      sample_id = sample_id,
+      FOXO3a = z,
+      protein_1 = protein_labels[first],
+      protein_2 = protein_labels[second],
+      protein_pair = pair_label,
+      inclusion_probability = vapply(
+        inclusion_probs_sym,
+        function(probability_matrix) probability_matrix[first, second],
+        numeric(1)
+      ),
+      check.names = FALSE
+    )
+  })
+)
+rownames(probability_table) <- NULL
+probability_table[["protein_pair"]] <- factor(
+  probability_table[["protein_pair"]],
+  levels = unique(probability_table[["protein_pair"]])
+)
+
+stopifnot(
+  nrow(probability_table) == n_samples * ncol(edge_pairs),
+  nrow(probability_table) == 2460L,
+  all(is.finite(probability_table[["inclusion_probability"]])),
+  all(probability_table[["inclusion_probability"]] >= 0),
+  all(probability_table[["inclusion_probability"]] <= 1),
+  all(vapply(
+    split(probability_table[["observation_index"]], probability_table[["protein_pair"]]),
+    identical,
+    logical(1),
+    seq_len(n_samples)
+  ))
+)
+
+graph_indices <- lapply(unique_graphs, function(graph_item) graph_item[["indices"]])
+all_graph_indices <- unname(unlist(graph_indices, use.names = FALSE))
+stopifnot(
+  length(all_graph_indices) == n_samples,
+  !anyDuplicated(all_graph_indices),
+  identical(sort(as.integer(all_graph_indices)), seq_len(n_samples))
+)
+
+graph_id <- rep(NA_integer_, n_samples)
+for (current_graph_id in seq_along(graph_indices)) {
+  graph_id[graph_indices[[current_graph_id]]] <- current_graph_id
+}
+stopifnot(!anyNA(graph_id))
+
+graph_assignment_table <- data.frame(
+  observation_index = seq_len(n_samples),
+  sample_id = sample_id,
+  FOXO3a = z,
+  graph_id = graph_id,
+  check.names = FALSE
+)
+
+edge_summary <- do.call(
+  rbind,
+  lapply(seq_len(ncol(edge_pairs)), function(pair_index) {
+    first <- edge_pairs[1L, pair_index]
+    second <- edge_pairs[2L, pair_index]
+    probabilities <- vapply(
+      inclusion_probs_sym,
+      function(probability_matrix) probability_matrix[first, second],
+      numeric(1)
+    )
+    data.frame(
+      `Protein 1` = protein_labels[first],
+      `Protein 2` = protein_labels[second],
+      `Minimum inclusion probability` = min(probabilities),
+      `Maximum inclusion probability` = max(probabilities),
+      `Samples with selected edge (%)` = 100 * mean(probabilities >= edge_threshold),
+      check.names = FALSE
+    )
+  })
+)
+
+results_directory <- dirname(paths[["result"]])
+utils::write.csv(
+  probability_table,
+  file.path(results_directory, "brca_edge_inclusion_probabilities.csv"),
+  row.names = FALSE
+)
+utils::write.csv(
+  graph_assignment_table,
+  file.path(results_directory, "brca_graph_assignments.csv"),
+  row.names = FALSE
+)
+```
+
+## Estimated graphs
+
+### Sample graph assignments
+
+Each point below is one sample, placed at its actual FOXO3a measurement and assigned to the graph ID stored in the fit. Colors consistently distinguish graph IDs in this plot, and the IDs match the heatmap titles below. The five distinct graphs do **not** imply five consecutive FOXO3a intervals: the same graph can occur at separated covariate values.
+
+```{r}
+#| label: graph-assignments
+#| fig-cap: "Estimated graph category for each sample at its actual FOXO3a value."
+#| fig-width: 10
+#| fig-height: 4.8
+graph_palette <- c("#1B9E77", "#D95F02", "#7570B3", "#E7298A", "#2C7FB8")
+graph_colors <- stats::setNames(
+  graph_palette[seq_along(unique_graphs)],
+  as.character(seq_along(unique_graphs))
+)
+
+graph_assignment_plot <- ggplot2::ggplot(
+  graph_assignment_table,
+  ggplot2::aes(
+    x = FOXO3a,
+    y = factor(graph_id, levels = seq_along(unique_graphs)),
+    color = factor(graph_id, levels = seq_along(unique_graphs))
+  )
+) +
+  ggplot2::geom_point(size = 1.8, alpha = 0.75) +
+  ggplot2::scale_color_manual(values = graph_colors, name = "Graph ID", drop = FALSE) +
+  ggplot2::labs(
+    x = "FOXO3a RPPA measurement",
+    y = "Estimated graph ID"
+  ) +
+  ggplot2::theme_bw(base_size = 12) +
+  ggplot2::theme(
+    panel.grid.minor = ggplot2::element_blank(),
+    legend.position = "bottom"
+  )
+
+ggplot2::ggsave(
+  filename = file.path(results_directory, "brca_graph_assignments_by_foxo3a.png"),
+  plot = graph_assignment_plot,
+  width = 10,
+  height = 4.8,
+  dpi = 300,
+  bg = "white"
+)
+graph_assignment_plot
+```
+
+### Unique graph heatmaps
+
+Each heatmap is a package-native `matViz()` view of one unique estimated adjacency matrix. Filled off-diagonal cells indicate model-selected conditional-dependence edges at the saved 0.5 threshold. Titles show how many samples receive each graph and the minimum and maximum FOXO3a values among those samples; these ranges summarize assigned samples and are not necessarily continuous interval boundaries. Graphs are ordered by their minimum assigned FOXO3a value for display, while their saved graph IDs are retained.
+
+```{r}
+#| label: estimated-graphs
+#| layout-ncol: 2
+#| fig-width: 6.5
+#| fig-height: 5.2
+#| fig-cap: "Unique estimated graphs across FOXO3a."
+graph_order <- order(vapply(
+  unique_graphs,
+  function(item) min(z[item[["indices"]]]),
+  numeric(1)
+))
+
+for (graph_index in graph_order) {
+  graph_item <- unique_graphs[[graph_index]]
+  graph_z <- z[graph_item[["indices"]]]
+  graph_plot <- covdepGE::matViz(graph_item[["graph"]], color2 = "#2C7FB8") +
+    ggplot2::scale_x_continuous(breaks = seq_along(protein_labels), labels = protein_labels) +
+    ggplot2::scale_y_continuous(breaks = seq_along(protein_labels), labels = protein_labels) +
+    ggplot2::labs(
+      title = paste0(
+        "Graph ", graph_index,
+        ": n = ", length(graph_item[["indices"]]),
+        ", FOXO3a [", format(min(graph_z), digits = 3),
+        ", ", format(max(graph_z), digits = 3), "]"
+      ),
+      x = NULL,
+      y = NULL
+    ) +
+    ggplot2::theme_bw(base_size = 10) +
+    ggplot2::theme(
+      legend.position = "none",
+      axis.text.x = ggplot2::element_text(angle = 35, hjust = 1),
+      plot.title = ggplot2::element_text(size = 10)
+    )
+  print(graph_plot)
+}
+```
+
+## Edge-inclusion probabilities across FOXO3a
+
+There are six possible undirected protein pairs. Each point shows a saved, symmetrized model-based edge-inclusion probability at that sample's actual FOXO3a measurement. The probabilities are not relationship strengths or partial correlations. Crossing the dashed saved threshold (`r edge_threshold`) determines whether an edge is selected under this fit. Replotting the saved results against FOXO3a does not change the estimates, and no smoother or new continuous function is fitted.
+
+```{r}
+#| label: inclusion-probabilities-foxo3a
+#| fig-cap: "Saved model-based edge-inclusion probabilities plotted against actual FOXO3a measurements; the dashed line is the saved selection threshold."
+#| fig-width: 10
+#| fig-height: 7.5
+edge_probability_plot <- ggplot2::ggplot(
+  probability_table,
+  ggplot2::aes(x = FOXO3a, y = inclusion_probability)
+) +
+  ggplot2::geom_hline(
+    yintercept = edge_threshold,
+    linetype = "dashed",
+    linewidth = 0.45,
+    color = "#444444"
+  ) +
+  ggplot2::geom_point(size = 1, alpha = 0.65, color = "#2C7FB8") +
+  ggplot2::facet_wrap(ggplot2::vars(protein_pair), ncol = 2) +
+  ggplot2::scale_y_continuous(
+    limits = c(0, 1),
+    breaks = seq(0, 1, by = 0.25),
+    expand = ggplot2::expansion(mult = c(0.01, 0.02))
+  ) +
+  ggplot2::labs(
+    x = "FOXO3a RPPA measurement",
+    y = "Model-based edge-inclusion probability"
+  ) +
+  ggplot2::theme_bw(base_size = 11) +
+  ggplot2::theme(
+    panel.grid.minor = ggplot2::element_blank(),
+    strip.text = ggplot2::element_text(face = "bold", size = 10)
+  )
+
+ggplot2::ggsave(
+  filename = file.path(results_directory, "brca_edge_inclusion_by_foxo3a.png"),
+  plot = edge_probability_plot,
+  width = 10,
+  height = 7.5,
+  dpi = 300,
+  bg = "white"
+)
+edge_probability_plot
+```
+
+### Pairwise saved-result summary
+
+The percentage is the share of these 410 samples whose saved inclusion probability meets the saved edge-selection threshold. It describes selections made by this fitted model and must not be interpreted as biological interaction prevalence.
+
+```{r}
+#| label: edge-summary
+knitr::kable(
+  edge_summary,
+  digits = 3,
+  caption = "Range of saved inclusion probabilities and percentage of samples with a selected edge.",
+  align = c("l", "l", "r", "r", "r")
+)
+```
+
+## Reproducibility
+
+The saved result bundle contains the fitted object, exact `X`, `z`, sample IDs, provenance, audit table, seed, function call, input checksums, elapsed time, warnings, and package/session versions. Rendering only reuses the bundle when both data checksums, all fit settings, and the installed `covdepGE` version match.
+
+```{r}
+#| label: checksums
+checksum_table <- data.frame(
+  File = c("Prepared input RDS", "Public BRCA.RPPA RDA"),
+  MD5 = c(inputs[["input_md5"]], inputs[["raw_md5"]]),
+  check.names = FALSE
+)
+knitr::kable(checksum_table, caption = "Input file fingerprints.", align = c("l", "l"))
+```
+
+### Session information
+
+```{r}
+#| label: session-info
+cat(paste(bundle[["metadata"]][["session_info"]], collapse = "\n"))
+```
+
+## Sources
+
+- Dasgupta et al., *An Approximate Bayesian Approach to Covariate-dependent Graphical Modeling* (2023).
+- [`covdepGE` package repository](https://github.com/JacobHelwig/covdepGE)
+- [Authors' public TCGA example](https://github.com/JacobHelwig/covdepGE/blob/master/examples/TCGA_analysis.md)
+- [Public `BRCA.RPPA.rda` source](https://github.com/RTCGA/RTCGA.RPPA/blob/master/data/BRCA.RPPA.rda)

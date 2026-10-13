@@ -208,6 +208,11 @@ tempCodeRunnerFile.py
 # Ruff stuff:
 .ruff_cache/
 
+# Project-local R library and generated model artifacts
+.Rlib/
+results/dasgupta_covdepge/*.rds
+results/dasgupta_covdepge/*.txt
+
 # PyPI configuration file
 .pypirc
 
